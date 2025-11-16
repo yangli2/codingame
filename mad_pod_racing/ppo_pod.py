@@ -4,7 +4,7 @@ import numpy as np
 
 class GlobalConstants:
     max_rotation_per_turn: int = 18
-    car_max_thrust: float = 200.
+    car_max_thrust: float = 100.
 
 
 @dataclass
@@ -35,6 +35,12 @@ class CheckpointInfo:
     angle_sin: float
     angle_cos: float
 
+    def __post_init__(self):
+        self.rel_dx = np.clip(self.rel_dx, -1., 1.)
+        self.rel_dy = np.clip(self.rel_dy, -1., 1.)
+        self.angle_sin = np.clip(self.angle_sin, -1., 1.)
+        self.angle_cos = np.clip(self.angle_cos, -1., 1.)
+
 
 @dataclass
 class PodInfo:
@@ -61,4 +67,115 @@ class Policy:
         output = self._relu(self._w1 @ output + self._b1)
         output = self._w2 @ output + self._b2
         return self._action_converter.get_angle_and_thrust(int(np.argmax(output)))
+
+
+def normalize_angle(x: float):
+    return x % (2. * math.pi)
+
+
+def get_heading(x, y, ncx, ncy, nca):
+    theta = normalize_angle(nca)
+    alpha = normalize_angle(math.atan2(ncy - y, ncx - x))
+    return normalize_angle(math.pi / 2. + alpha - theta)
+
+
+def clockwise_rotation_matrix(angle: float) -> np.ndarray:
+    # https://en.wikipedia.org/wiki/Rotation_matrix#Direction
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array([[c, s], [-s, c]])
+
+
+class Pod:
+    def __init__(self):
+        self.position = None
+        self.velocity = np.array([0, 0])
+        self.speed = 0
+        self.next_checkpoint_id: int = 0
+        self.checkpoints = []
+        self.lap = -1
+        self.lap_incremented = False
+        self.policy = Policy()
+        self.width = 16000
+        self.height = 9000
+        self.distance_upper_bound = np.linalg.norm([self.width, self.height])
+
+    def update(self, x: float, y: float, ncx: float, ncy: float, ncd: float, nca: float):
+        # Calculate velocity
+        new_position = np.array([x, y])
+        if self.position is None:
+            # Avoid computing a very large initial velocity
+            self.position = new_position
+        self.velocity = new_position - self.position
+        self.speed = np.linalg.norm(self.velocity)
+        self.position = new_position
+
+        self.x = x
+        self.y = y
+        self.angle = math.radians(nca)
+        self.heading = get_heading(x, y, ncx, ncy, nca)
+
+        nc = (ncx, ncy)
+        try:
+            self.next_checkpoint_id = self.checkpoints.index(nc)
+            if self.next_checkpoint_id == 0 and not self.lap_incremented:
+                print(f"Incrementing lap to {self.lap}", file=sys.stderr)
+                self.lap += 1
+                self.lap_incremented = True
+            elif self.next_checkpoint_id > 0:
+                self.lap_incremented = False
+        except ValueError:
+            self.checkpoints.append(nc)
+            self.next_checkpoint_id = len(self.checkpoints) - 1
+
+    def get_ckpt_info(self, ckpt_x: float, ckpt_y: float) -> CheckpointInfo:
+        r = clockwise_rotation_matrix(self.angle)
+        dx, dy = r @ [ckpt_x - self.x, ckpt_y - self.y]
+        relative_angle = (np.arctan2(dy, dx) + np.pi) % (2 * np.pi) - np.pi
+        return CheckpointInfo(
+                rel_dx=dx / self.distance_upper_bound,
+                rel_dy=dy / self.distance_upper_bound,
+                angle_sin=np.sin(relative_angle),
+                angle_cos=np.cos(relative_angle),
+        )
+
+
+    def get_action(self):
+        nc_info = self.get_ckpt_info(*self.checkpoints[self.next_checkpoint_id])
+        pod_info = PodInfo(
+                rel_vx=self.velocity[0] / GlobalConstants.car_max_thrust,
+                rel_vy=self.velocity[1] / GlobalConstants.car_max_thrust,
+        )
+        if pod.lap <= 0:
+            nnc_info = nc_info
+        else:
+            nnc_info = self.get_ckpt_info(*self.checkpoints[(self.next_checkpoint_id + 1) % len(self.checkpoints)])\
+        angle, thrust = self.policy.predict(nc_info, nnc_info, pod_info)
+        print(f"angle and thrust: {angle}, {thrust}")
+        r = clockwise_rotation_matrix(angle / 180. * np.pi)
+        target_vector = self.position + r @ self.velocity
+        print(f"target_vector: {target_vector}")
+        return target_vector, thrust
         
+
+pod = Pod()
+# game loop
+while True:
+    # next_checkpoint_x: x position of the next check point
+    # next_checkpoint_y: y position of the next check point
+    # next_checkpoint_dist: distance to the next checkpoint
+    # next_checkpoint_angle: angle between your pod orientation and the direction of the next checkpoint
+    pod_x, pod_y, ncx, ncy, ncd, nca = [int(i) for i in input().split()]
+    opponent_x, opponent_y = [int(i) for i in input().split()]
+
+    # Write an action using print
+    # To debug: print("Debug messages...", file=sys.stderr)
+
+    pod.update(pod_x, pod_y, ncx, ncy, ncd, nca)
+    target_vector, thrust = pod.get_action()
+    target_x, target_y = target_vector
+    thrust = int(thrust)
+
+    # You have to output the target position
+    # followed by the power (0 <= thrust <= 100)
+    # i.e.: "x y thrust"
+    print(f"{target_x} {target_y} {thrust}")
